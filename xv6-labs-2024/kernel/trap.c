@@ -65,6 +65,9 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 15 &&
+            cowalloc(p->pagetable, r_stval()) == 0){
+    // Falha de escrita COW resolvida.
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

@@ -23,10 +23,19 @@ struct {
   struct run *freelist;
 } kmem;
 
+#define NPAGE ((PHYSTOP - KERNBASE) / PGSIZE)
+
+struct {
+  struct spinlock lock;
+  int count[NPAGE];
+} ref;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&ref.lock, "ref");
+
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -34,22 +43,46 @@ void
 freerange(void *pa_start, void *pa_end)
 {
   char *p;
+
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE) {
+    ref.count[((uint64)p - KERNBASE) / PGSIZE] = 1;
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
 // initializing the allocator; see kinit above.)
+
 void
 kfree(void *pa)
 {
   struct run *r;
+  int index;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char*)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  index = ((uint64)pa - KERNBASE) / PGSIZE;
+
+  acquire(&ref.lock);
+
+  if(ref.count[index] < 1)
+    panic("kfree ref");
+
+  ref.count[index]--;
+
+  if(ref.count[index] > 0) {
+    release(&ref.lock);
+    return;
+  }
+
+  release(&ref.lock);
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -62,21 +95,58 @@ kfree(void *pa)
   release(&kmem.lock);
 }
 
+
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
 // Returns 0 if the memory cannot be allocated.
+
 void *
 kalloc(void)
 {
   struct run *r;
+  int index;
 
   acquire(&kmem.lock);
+
   r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
 
   if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+    kmem.freelist = r->next;
+
+  release(&kmem.lock);
+
+  if(r) {
+    index = ((uint64)r - KERNBASE) / PGSIZE;
+
+    acquire(&ref.lock);
+    ref.count[index] = 1;
+    release(&ref.lock);
+
+    memset((char*)r, 5, PGSIZE);
+  }
+
   return (void*)r;
+}
+
+
+void
+krefinc(uint64 pa)
+{
+  int index;
+
+  if(pa % PGSIZE != 0 ||
+     pa < KERNBASE ||
+     pa >= PHYSTOP)
+    panic("krefinc");
+
+  index = (pa - KERNBASE) / PGSIZE;
+
+  acquire(&ref.lock);
+
+  if(ref.count[index] < 1)
+    panic("krefinc ref");
+
+  ref.count[index]++;
+
+  release(&ref.lock);
 }
